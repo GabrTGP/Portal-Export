@@ -1,0 +1,56 @@
+name: Build Runner Image
+
+on:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: GabrTGP/Portal
+          ref: tools
+          ssh-key: ${{ secrets.PORTAL_DEPLOY_KEY }}
+
+      # Pull bpmn_to_vsdx.py from our server (it lives in the Portal-Server
+      # submodule; the runner image bakes it in so export runtime needs no fetch).
+      - name: Fetch bpmn_to_vsdx.py from server
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          mkdir -p ~/.ssh && echo "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            root@"$SERVER_HOST" \
+            "cat /opt/portal/server/bpmn_to_vsdx.py" \
+            > bpmn_to_vsdx.py
+          echo "Fetched bpmn_to_vsdx.py ($(wc -l < bpmn_to_vsdx.py) lines)"
+
+      - name: Lowercase image name
+        id: meta
+        run: echo "image=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/portal-runner" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/Dockerfile.runner
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:latest
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:${{ github.sha }}

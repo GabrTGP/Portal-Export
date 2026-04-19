@@ -1,0 +1,454 @@
+name: Export PDFs
+
+on:
+  workflow_dispatch:
+    inputs:
+      types:
+        description: 'Export types (comma-separated: sop,wi,raci,sm,ed,bpmn-pdf,bpmn-png,screenshots)'
+        required: true
+        default: 'sm'
+      departments:
+        description: 'Departments (comma-separated, or "all" for all 15)'
+        required: true
+        default: 'all'
+      processes:
+        description: 'Process filter — JSON dict {"dept":["name"|"process-N"|"slug"]} OR comma list ["process-6"] applied to all depts. Leave blank for all processes.'
+        required: false
+        default: ''
+      scale:
+        description: 'html2canvas scale 1-5'
+        required: false
+        default: '2'
+      dpr:
+        description: 'Device pixel ratio 1-5'
+        required: false
+        default: '3'
+      parallel:
+        description: 'Parallel processes per worker'
+        required: false
+        default: '2'
+      runners:
+        description: 'Number of parallel GH runners (1-20)'
+        required: false
+        default: '3'
+      containers:
+        description: 'Number of server Docker containers (0 = GH runners only)'
+        required: false
+        default: '3'
+      use_container:
+        description: 'Use pre-built GHCR runner image (skips npm/playwright install)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      # folder_structure removed — always dept-first to prevent duplicate paths.
+      # Sync to drive handles restructuring via staging symlinks.
+      dry_run_dept:
+        description: 'Dry run — single dept slug (empty = disabled)'
+        required: false
+        default: ''
+
+env:
+  SERVER_HOST: ${{ secrets.SERVER_HOST }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.setup.outputs.matrix }}
+      total: ${{ steps.setup.outputs.total }}
+      server_only: ${{ steps.setup.outputs.server_only }}
+    steps:
+      - name: Create shared queue on server
+        id: setup
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          API_AUTH: ${{ secrets.EXPORT_API_AUTH }}
+          # Pass processes input via env so embedded JSON quotes don't break
+          # out of the inline ${{ }} substitution in the shell script.
+          PROCESSES_INPUT: ${{ github.event.inputs.processes }}
+        run: |
+          RUNNERS=${{ github.event.inputs.runners }}
+          TYPES="${{ github.event.inputs.types }}"
+          DEPTS="${{ github.event.inputs.departments }}"
+
+          # Dry run override — caller can pass a single dept slug to validate.
+          DRY_DEPT="${{ github.event.inputs.dry_run_dept }}"
+          if [ -n "$DRY_DEPT" ]; then
+            echo "DRY RUN — overriding to 1 runner, dept=$DRY_DEPT"
+            RUNNERS=1
+            DEPTS="$DRY_DEPT"
+          fi
+
+          # Classify types: heavy (sop,sm) → GH runners, light (all others) → containers
+          HAS_HEAVY=false
+          HAS_LIGHT=false
+          for t in $(echo "$TYPES" | tr ',' ' '); do
+            case "$t" in
+              sop|sm) HAS_HEAVY=true ;;
+              *) HAS_LIGHT=true ;;
+            esac
+          done
+
+          CONTAINERS=${{ github.event.inputs.containers }}
+          if [ "$HAS_LIGHT" = "true" ] && [ "$HAS_HEAVY" = "false" ]; then
+            if [ "$CONTAINERS" -gt 0 ]; then
+              # All lightweight with containers — containers only, no runners
+              echo "All lightweight types — delegating to $CONTAINERS server containers, no GH runners"
+              echo "server_only=true" >> "$GITHUB_OUTPUT"
+            else
+              # All lightweight, containers=0 — force GH runners to handle them
+              echo "All lightweight types, containers=0 — $RUNNERS GH runners only"
+              echo "server_only=false" >> "$GITHUB_OUTPUT"
+            fi
+          elif [ "$HAS_HEAVY" = "true" ] && [ "$HAS_LIGHT" = "false" ]; then
+            # All heavy — runners only, force containers=0
+            CONTAINERS=0
+            echo "All heavy types (SOP/SM) — $RUNNERS GH runners only, containers=0"
+            echo "server_only=false" >> "$GITHUB_OUTPUT"
+          else
+            # Mixed — containers handle light phase, runners handle heavy phase
+            echo "server_only=false" >> "$GITHUB_OUTPUT"
+            echo "Hybrid mode — containers for light types + $RUNNERS GH runners for heavy types"
+          fi
+
+          # Create queue via API
+          # If 409 (queue already active), join the existing queue (hybrid mode)
+          TYPES_JSON=$(echo "$TYPES" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip().split(',')))")
+          # Optional process filter — accepts either a JSON dict
+          # ({"dept_id":["process-N"|"slug"|"name"]}) for per-dept targeting,
+          # or a comma-separated flat list (e.g. "process-6,some-slug") applied
+          # to all depts selected above. Empty = no filter (existing behaviour).
+          PROCESSES_RAW="$PROCESSES_INPUT"
+          PROCESSES_JSON=""
+          if [ -n "$PROCESSES_RAW" ]; then
+            PROCESSES_JSON=$(python3 -c "import sys,json; raw=sys.argv[1].strip(); print(json.dumps(json.loads(raw)) if raw.startswith('{') or raw.startswith('[') else json.dumps([p.strip() for p in raw.split(',') if p.strip()]))" "$PROCESSES_RAW")
+            echo "Process filter: $PROCESSES_JSON"
+          fi
+          if [ "$DEPTS" = "all" ]; then
+            BODY="{\"types\":$TYPES_JSON,\"containers\":$CONTAINERS,\"parallel\":${{ github.event.inputs.parallel }},\"queueRef\":\"${{ github.run_id }}\"}"
+          else
+            DEPTS_JSON=$(echo "$DEPTS" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip().split(',')))")
+            BODY="{\"types\":$TYPES_JSON,\"depts\":$DEPTS_JSON,\"containers\":$CONTAINERS,\"parallel\":${{ github.event.inputs.parallel }},\"queueRef\":\"${{ github.run_id }}\"}"
+          fi
+          if [ -n "$PROCESSES_JSON" ]; then
+            # Splice "processes":<json> into the body just before the closing brace.
+            BODY=$(echo "$BODY" | sed "s/}$/,\"processes\":$PROCESSES_JSON}/")
+          fi
+          echo "Creating queue: $BODY"
+          HTTP_CODE=$(curl -s -o /tmp/api-resp.json -w "%{http_code}" -X POST "http://$SERVER_HOST:9091/api/export/start" \
+            -u "$API_AUTH" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+          RESP=$(cat /tmp/api-resp.json)
+          echo "API response ($HTTP_CODE): $RESP"
+          if [ "$HTTP_CODE" = "409" ]; then
+            echo "Queue already active — joining as additional runners (hybrid mode)"
+            RESP=$(curl -s -u "$API_AUTH" "http://$SERVER_HOST:9091/api/export/status")
+            TOTAL=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); qp=d.get('queueProgress',{}).get('all',{}); print(qp.get('total',77))")
+          else
+            RESUMED=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('resumed',False))" 2>/dev/null || echo "False")
+            if [ "$RESUMED" = "True" ]; then
+              TOTAL=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('pending',0))")
+              echo "Resumed existing queue — $(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d.get(\"done\",0)} done, {d.get(\"pending\",0)} pending')")"
+            else
+              TOTAL=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('processCount',0))")
+            fi
+          fi
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+          # Build runner matrix
+          if [ "$ALL_LIGHTWEIGHT" = "true" ] && [ "$CONTAINERS" -gt 0 ]; then
+            # Server-only mode — no GH runners needed
+            RUNNERS=0
+            MATRIX='{"include":[]}'
+          else
+            # Cap to total items and ensure ≥5 items per runner to avoid setup waste
+            RUNNERS=$(( RUNNERS < TOTAL ? RUNNERS : TOTAL ))
+            MAX_BY_WORK=$(( (TOTAL + 4) / 5 ))  # ceil(TOTAL/5)
+            [ "$MAX_BY_WORK" -lt 1 ] && MAX_BY_WORK=1
+            RUNNERS=$(( RUNNERS < MAX_BY_WORK ? RUNNERS : MAX_BY_WORK ))
+            [ "$RUNNERS" -lt 1 ] && RUNNERS=1
+            MATRIX=$(python3 -c "import json; print(json.dumps({'include':[{'runner':i} for i in range($RUNNERS)]}))")
+          fi
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Dispatching $RUNNERS runners for $TOTAL work items (containers=$CONTAINERS)"
+
+          # Notify server with GH Actions status
+          if [ -n "$SSH_KEY" ]; then
+            mkdir -p ~/.ssh && echo "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+            ssh-keyscan -H $SERVER_HOST >> ~/.ssh/known_hosts 2>/dev/null
+            ssh -o StrictHostKeyChecking=no root@$SERVER_HOST "mkdir -p /tmp/portal-pdfs && cat > /tmp/portal-pdfs/gh-actions-status-${{ github.run_id }}.json" <<EOJSON
+          {"source":"github-actions","run_id":${{ github.run_id }},"run_url":"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}","status":"running","types":"$TYPES","departments":"$DEPTS","runners":$RUNNERS,"total_items":$TOTAL,"started_at":"$(TZ=Etc/GMT-2 date +%Y-%m-%dT%H:%M:%S+02:00)","completed_runners":0,"failed_runners":0}
+          EOJSON
+          fi
+
+  export:
+    needs: prepare
+    if: needs.prepare.outputs.server_only != 'true'
+    runs-on: ubuntu-latest
+    container: ${{ github.event.inputs.use_container == 'true' && 'ghcr.io/gabrtgp/portal-runner:latest' || '' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: GabrTGP/Portal
+          ref: tools
+          ssh-key: ${{ secrets.PORTAL_DEPLOY_KEY }}
+          submodules: false
+
+      # Portal-Server is a submodule but the runner has no deploy key for it.
+      # The VISIO converter script is baked into the runner image at
+      # /opt/portal-runner/bpmn_to_vsdx.py by build-runner-image; copy it into
+      # Source/server/ where export-sop-headed.js expects it.
+      - name: Stage bpmn_to_vsdx.py from image
+        run: |
+          mkdir -p Source/server
+          SRC=/opt/portal-runner/bpmn_to_vsdx.py
+          if [ -f "$SRC" ]; then
+            cp "$SRC" Source/server/bpmn_to_vsdx.py
+            echo "Staged VISIO converter script ($(wc -l < Source/server/bpmn_to_vsdx.py) lines)"
+          else
+            echo "Warning: $SRC not found in runner image — VISIO export will fail"
+          fi
+
+      # Checkout private data repo (processes.js, screenshots, department.js)
+      - uses: actions/checkout@v4
+        with:
+          repository: GabrTGP/Portal-Data
+          path: ./_data
+          ssh-key: ${{ secrets.PORTAL_DATA_DEPLOY_KEY }}
+
+      - name: Link data into place
+        run: |
+          # Discover departments from the private data repo — no hardcoded list.
+          for ddir in _data/*/; do
+            dept="$(basename "$ddir")"
+            [ -d "Source/$dept" ] || continue
+            for sub in "assets/data" "assets/images" "bpmn"; do
+              if [ -d "_data/$dept/$sub" ]; then
+                rm -rf "Source/$dept/$sub" 2>/dev/null
+                ln -sf "$(pwd)/_data/$dept/$sub" "Source/$dept/$sub"
+              fi
+            done
+          done
+          echo "Data linked from Portal-Data for $(ls -d _data/*/assets/data 2>/dev/null | wc -l) departments"
+          # All code lives under Source/ — cd there for remaining steps
+          echo "PORTAL_SOURCE=$(pwd)/Source" >> "$GITHUB_ENV"
+
+      # --- Standard setup (skipped when using pre-built container image) ---
+      - uses: actions/setup-node@v4
+        if: github.event.inputs.use_container != 'true'
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: Source/package-lock.json
+      - name: Get Playwright version
+        if: github.event.inputs.use_container != 'true'
+        id: pw-version
+        run: |
+          PW_VER=$(node -p "require('./Source/package-lock.json').packages['node_modules/@playwright/test']?.version || require('./Source/package-lock.json').packages['node_modules/playwright']?.version || 'unknown'")
+          echo "version=$PW_VER" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright browsers
+        if: github.event.inputs.use_container != 'true'
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ steps.pw-version.outputs.version }}
+      - name: Install dependencies
+        if: github.event.inputs.use_container != 'true'
+        working-directory: Source
+        run: |
+          npm ci
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "Playwright cache hit — installing system deps only"
+            npx playwright install-deps chromium
+          else
+            echo "Playwright cache miss — full install"
+            npx playwright install chromium --with-deps
+          fi
+
+      # --- Container-mode setup (reuse pre-installed deps from /runner) ---
+      - name: Link pre-built deps (container mode)
+        if: github.event.inputs.use_container == 'true'
+        run: |
+          cd Source
+          # Reuse node_modules from container image if package-lock matches
+          if [ -d /runner/node_modules ] && diff -q package-lock.json /runner/package-lock.json >/dev/null 2>&1; then
+            echo "Package lock matches container — linking node_modules"
+            ln -s /runner/node_modules node_modules
+          else
+            echo "Package lock changed — running npm ci"
+            npm ci
+          fi
+          # Playwright browsers were installed as root during docker build (/root/.cache/ms-playwright)
+          # but GH Actions sets HOME=/github/home — symlink so Playwright finds them
+          if [ -d /root/.cache/ms-playwright ] && [ ! -d "$HOME/.cache/ms-playwright" ]; then
+            mkdir -p "$HOME/.cache"
+            ln -s /root/.cache/ms-playwright "$HOME/.cache/ms-playwright"
+            echo "Linked Playwright browsers: /root/.cache/ms-playwright → $HOME/.cache/ms-playwright"
+          fi
+          # Verify Chromium is accessible
+          CHROME_PATH=$(node -e "try{const{chromium}=require('playwright');console.log(chromium.executablePath())}catch(e){}" 2>/dev/null)
+          if [ -n "$CHROME_PATH" ] && [ -f "$CHROME_PATH" ]; then
+            echo "Chromium OK at $CHROME_PATH"
+          else
+            echo "Chromium not found — installing"
+            npx playwright install chromium
+          fi
+
+      - name: Setup SSH
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        if: env.SSH_KEY != ''
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n" > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          # In container mode, also ensure /root/.ssh exists (rsync may run as root)
+          if [ -d /runner ] && [ "$(id -u)" = "0" ] && [ "$HOME" != "/root" ]; then
+            mkdir -p /root/.ssh && cp ~/.ssh/id_ed25519 /root/.ssh/ && chmod 600 /root/.ssh/id_ed25519
+            cp ~/.ssh/config /root/.ssh/ && chmod 600 /root/.ssh/config
+          fi
+          echo "SSH key configured (HOME=$HOME, user=$(whoami))"
+      - name: Run export
+        id: run-export
+        env:
+          API_AUTH: ${{ secrets.EXPORT_API_AUTH }}
+        run: |
+          mkdir -p /tmp/portal-pdfs/logs
+          LOG_FILE=/tmp/portal-pdfs/logs/runner-${{ matrix.runner }}.log
+          # Background sync every 2min — only when new files appear
+          if [ -f ~/.ssh/id_ed25519 ]; then
+            LAST_SYNC_COUNT=0
+            (while true; do
+              sleep 120
+              CUR_COUNT=$(find /tmp/portal-pdfs -type f \( -name '*.pdf' -o -name '*.png' \) 2>/dev/null | wc -l)
+              if [ "$CUR_COUNT" -gt "$LAST_SYNC_COUNT" ]; then
+                rsync -az -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --exclude='*.log.tmp' /tmp/portal-pdfs/ root@$SERVER_HOST:/tmp/portal-pdfs/ 2>/dev/null
+                LAST_SYNC_COUNT=$CUR_COUNT
+              fi
+            done) &
+            LOG_SYNC_PID=$!
+            echo "Started background sync (PID=$LOG_SYNC_PID, interval=2min, conditional)"
+          fi
+          # Capture node exit code via temp file (PIPESTATUS not available in sh)
+          # Pick queue phase: heavy when any heavy type was requested, else light.
+          TYPES_INPUT="${{ github.event.inputs.types }}"
+          PHASE=light
+          for t in $(echo "$TYPES_INPUT" | tr ',' ' '); do
+            case "$t" in sop|sm) PHASE=heavy; break ;; esac
+          done
+          set +e
+          FOLDER_FLAG="--dept-first"
+          (node Source/scripts/export-sop-headed.js \
+            --queue-api "http://$SERVER_HOST:9091" \
+            --queue-api-auth "$API_AUTH" \
+            --scale ${{ github.event.inputs.scale }} \
+            --dpr ${{ github.event.inputs.dpr }} \
+            --parallel ${{ github.event.inputs.parallel }} \
+            --output /tmp/portal-pdfs \
+            --worker-id runner-${{ matrix.runner }} \
+            --queue-ref "${{ github.run_id }}" \
+            --queue-phase "$PHASE" \
+            $FOLDER_FLAG \
+            2>&1; echo $? > /tmp/_export_exit) | tee "$LOG_FILE"
+          EXPORT_EXIT=$(cat /tmp/_export_exit 2>/dev/null || echo 1)
+          set -e
+          # Stop background sync and do final sync
+          [ -n "$LOG_SYNC_PID" ] && kill $LOG_SYNC_PID 2>/dev/null || true
+          [ -f ~/.ssh/id_ed25519 ] && rsync -az -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --exclude='*.log.tmp' /tmp/portal-pdfs/ root@$SERVER_HOST:/tmp/portal-pdfs/ 2>/dev/null || true
+          exit $EXPORT_EXIT
+        timeout-minutes: 120
+      - name: Deploy to server
+        if: always()
+        env:
+          EXPORT_OUTCOME: ${{ steps.run-export.outcome }}
+        run: |
+          if [ ! -f ~/.ssh/id_ed25519 ]; then echo "No SSH key"; exit 0; fi
+          PDF_COUNT=$(find /tmp/portal-pdfs -name '*.pdf' 2>/dev/null | wc -l)
+          echo "Deploying $PDF_COUNT PDFs (export: $EXPORT_OUTCOME)..."
+          # Sync PDFs and logs to server (non-fatal — don't fail the step on rsync error)
+          if [ "$PDF_COUNT" -gt 0 ] || [ -d /tmp/portal-pdfs/logs ]; then
+            rsync -az -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" /tmp/portal-pdfs/ root@$SERVER_HOST:/tmp/portal-pdfs/ || echo "Warning: rsync to server failed (exit $?)"
+          fi
+          # Update runner status on server (non-fatal)
+          FAILED=0; [ "$EXPORT_OUTCOME" != "success" ] && FAILED=1
+          ssh -o StrictHostKeyChecking=no root@$SERVER_HOST "python3 -c \"
+          import json
+          with open('/tmp/portal-pdfs/gh-actions-status-${{ github.run_id }}.json') as f: d = json.load(f)
+          d['completed_runners'] = d.get('completed_runners', 0) + 1
+          d['failed_runners'] = d.get('failed_runners', 0) + $FAILED
+          d['runner_${{ matrix.runner }}_done'] = True
+          d['runner_${{ matrix.runner }}_pdfs'] = $PDF_COUNT
+          d['runner_${{ matrix.runner }}_status'] = '$EXPORT_OUTCOME'
+          if d['completed_runners'] >= d.get('runners', 1):
+              d['status'] = 'failed' if d.get('failed_runners', 0) > 0 else 'completed'
+              d['completed_at'] = '$(TZ=Etc/GMT-2 date +%Y-%m-%dT%H:%M:%S+02:00)'
+          with open('/tmp/portal-pdfs/gh-actions-status-${{ github.run_id }}.json', 'w') as f: json.dump(d, f, indent=2)
+          print(f'Progress: {d[\\\"completed_runners\\\"]}/{d[\\\"runners\\\"]} runners done')
+          \"" || echo "Warning: status update failed (exit $?)"
+      - name: Verify exported files on server
+        if: always()
+        run: |
+          if [ ! -f ~/.ssh/id_ed25519 ]; then exit 0; fi
+          echo "Verifying exported PDFs exist on server..."
+          MISSING=$(ssh -o StrictHostKeyChecking=no root@$SERVER_HOST \
+            "python3 /opt/portal/server/verify_export.py" \
+            2>/dev/null || echo "VERIFY_FAILED")
+          if echo "$MISSING" | grep -q "^MISSING:"; then
+            echo "::warning::Some exported files are missing on server:"
+            echo "$MISSING"
+          elif echo "$MISSING" | grep -q "ALL_OK"; then
+            echo "All exported files verified on server."
+          fi
+      - name: Rebuild ZIP if last runner
+        if: always()
+        run: |
+          if [ ! -f ~/.ssh/id_ed25519 ]; then exit 0; fi
+          IS_DONE=$(ssh -o StrictHostKeyChecking=no root@$SERVER_HOST "python3 -c \"
+          import json
+          with open('/tmp/portal-pdfs/gh-actions-status-${{ github.run_id }}.json') as f: d = json.load(f)
+          print('yes' if d.get('status') in ('completed','failed') else 'no')
+          \"" 2>/dev/null || echo "no")
+          [ "$IS_DONE" = "yes" ] && echo "Rebuilding ZIP..." && ssh -o StrictHostKeyChecking=no root@$SERVER_HOST "curl -s -X POST http://localhost:9091/api/rebuild-zip" || echo "Skipping ZIP rebuild"
+
+  notify:
+    needs: [prepare, export]
+    if: always() && needs.prepare.outputs.server_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify server of workflow result
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          if [ -z "$SSH_KEY" ]; then exit 0; fi
+          mkdir -p ~/.ssh && echo "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H $SERVER_HOST >> ~/.ssh/known_hosts 2>/dev/null
+
+          EXPORT_RESULT="${{ needs.export.result }}"
+          STATUS="completed"
+          [ "$EXPORT_RESULT" != "success" ] && STATUS="failed"
+
+          ssh -o StrictHostKeyChecking=no root@$SERVER_HOST "python3 -c \"
+          import json, os
+          path = '/tmp/portal-pdfs/gh-actions-status-${{ github.run_id }}.json'
+          if not os.path.exists(path):
+              print('No status file found'); exit(0)
+          with open(path) as f: d = json.load(f)
+          d['status'] = '$STATUS'
+          d['completed_at'] = '$(TZ=Etc/GMT-2 date +%Y-%m-%dT%H:%M:%S+02:00)'
+          with open(path, 'w') as f: json.dump(d, f, indent=2)
+          print(f'Workflow $STATUS — {d.get(\\\"completed_runners\\\", 0)}/{d.get(\\\"runners\\\", 0)} runners, failed: {d.get(\\\"failed_runners\\\", 0)}')
+          \"" || echo "Warning: notify SSH failed (exit $?)"
+
+          echo "::notice::Export workflow $STATUS (export result: $EXPORT_RESULT)"
+          if [ "$STATUS" = "failed" ]; then
+            echo "::error::Export PDFs workflow failed — check runner logs at http://$SERVER_HOST:9090/"
+          fi
