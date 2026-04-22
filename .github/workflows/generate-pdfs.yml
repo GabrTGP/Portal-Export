@@ -82,12 +82,13 @@ jobs:
             DEPTS="$DRY_DEPT"
           fi
 
-          # Classify types: heavy (sop,sm) → GH runners, light (all others) → containers
+          # Classify types: heavy (sop,sm,wi,raci,ed — all html2canvas/browser) → GH runners;
+          # light (bpmn-pdf,bpmn-png,visio,screenshots,sm-pptx,sop-docx — pure Node.js) → containers
           HAS_HEAVY=false
           HAS_LIGHT=false
           for t in $(echo "$TYPES" | tr ',' ' '); do
             case "$t" in
-              sop|sm) HAS_HEAVY=true ;;
+              sop|sm|wi|raci|ed) HAS_HEAVY=true ;;
               *) HAS_LIGHT=true ;;
             esac
           done
@@ -343,7 +344,7 @@ jobs:
           TYPES_INPUT="${{ github.event.inputs.types }}"
           PHASE=light
           for t in $(echo "$TYPES_INPUT" | tr ',' ' '); do
-            case "$t" in sop|sm) PHASE=heavy; break ;; esac
+            case "$t" in sop|sm|wi|raci|ed) PHASE=heavy; break ;; esac
           done
           set +e
           FOLDER_FLAG="--dept-first"
